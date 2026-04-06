@@ -6580,7 +6580,7 @@ async function doSell(mint,reason){
     if(S.ws?.readyState===1)S.ws.send(WS_UNSUB_TOK(mint));
     S.log.unshift({sym:pos.sym,mint,pnlPct,pnlSOL,reason,holdSecs,win:isWin,ts:Date.now()});
     ATR_STOP.clean(mint);LIQUIDITY.clean(mint);LIQUIDITY.clean(mint);
-    setTimeout(()=>{mlLearnFromTrade(pos,pnlPct,isWin);OPTIMIZER.recordOutcome(pos,pnlPct,holdSecs);WALLET_DARWIN.recordOutcome(pos.sourceWallet,isWin,pnlPct,pnlSOL,holdSecs,reason);},0);
+    setTimeout(()=>{mlLearnFromTrade(pos,pnlPct,isWin);OPTIMIZER.recordOutcome(pos,pnlPct,holdSecs);if(OPTIMIZER._history.length%25===0)OPTIMIZER.optimize();WALLET_DARWIN.recordOutcome(pos.sourceWallet,isWin,pnlPct,pnlSOL,holdSecs,reason);},0);
     if(S.log.length>200)S.log.pop();
     toast((isWin?'\ud83d\udcc4\ud83d\udcb0':'\ud83d\udcc4\ud83d\udcc9')+' PAPER '+pos.sym+' '+(pnlPct>=0?'+':'')+pnlPct.toFixed(1)+'%',isWin?'close':'loss');
     addFeed(isWin?'win':'loss','\ud83d\udcc4 '+(isWin?'\ud83d\udcb0':'\ud83d\udcc9')+' PAPER '+pos.sym+' '+(pnlPct>=0?'+':'')+pnlPct.toFixed(1)+'%',reason+' held '+holdSecs.toFixed(0)+'s '+(pnlSOL>=0?'+':'')+pnlSOL.toFixed(4)+'\u25ce');
@@ -6639,7 +6639,7 @@ async function doSell(mint,reason){
         holdSecs, win:isWin, tier:pos.tier, ts:Date.now() });
       CALIBRATOR.processTrade(mint, pos, pnlPct);
       ATR_STOP.clean(mint);
-      setTimeout(()=>{mlLearnFromTrade(pos,pnlPct,isWin);OPTIMIZER.recordOutcome(pos,pnlPct,holdSecs);WALLET_DARWIN.recordOutcome(pos.sourceWallet,isWin,pnlPct,pnlSOL,holdSecs,reason);},0);
+      setTimeout(()=>{mlLearnFromTrade(pos,pnlPct,isWin);OPTIMIZER.recordOutcome(pos,pnlPct,holdSecs);if(OPTIMIZER._history.length%25===0)OPTIMIZER.optimize();WALLET_DARWIN.recordOutcome(pos.sourceWallet,isWin,pnlPct,pnlSOL,holdSecs,reason);},0);
     });
   }catch(err){
     console.error('[MCHPai] SELL FAILED:',err.message);
@@ -7039,6 +7039,12 @@ function renderUI(){
   setText('ml-ntm-size',NTM.size||0);
   const _cr=HMM.currentRegime();setText('ml-regime',_cr.name+' '+(_cr.conf*100).toFixed(0)+'%');
   setText('ml-ens-weights',Object.entries(ENSEMBLE.weights).map(([k,v])=>k.slice(0,4)+':'+(v*100).toFixed(0)+'%').join(' '));
+  // ── 40× OPTIMIZER STATS ──
+  const _os=OPTIMIZER.stats();
+  setText('ml-ens-weights',
+    '40x: LES='+SIGNAL_PARAMS.LES_w.toFixed(2)+' SMP='+SIGNAL_PARAMS.SMP_w.toFixed(2)+
+    ' CI='+SIGNAL_PARAMS.CI_w.toFixed(2)+' MA='+SIGNAL_PARAMS.MA_w.toFixed(2)+
+    ' | gen'+_os.generation+' obj='+_os.objective+' wr='+_os.recentWR);
   // ── DARWIN STATS ──
   // Intent engine stats
   setText('wi-sessions',WALLET_INTENT.sessionCount);
