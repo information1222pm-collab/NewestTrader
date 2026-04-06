@@ -1,0 +1,62 @@
+{
+  "name": "PUMP_FORECAST",
+  "version": "1.0.0",
+  "type": "ML_SYSTEM",
+  "description": "Real-time microstructure predictor that forecasts P(token gains ≥50% within 120 seconds). 32-feature online logistic regression with polynomial interactions. Gates buy entries in both paper and live modes.",
+  "status": "INTEGRATED",
+  "date": "2026-04-06",
+  "architecture": {
+    "model_type": "Online Logistic Regression with Momentum SGD",
+    "raw_features": 24,
+    "polynomial_features": 8,
+    "total_features": 32,
+    "learning_rate": 0.005,
+    "momentum": 0.93,
+    "l2_regularization": 0.0005,
+    "cold_start_threshold": 30,
+    "persistence": "localStorage (mchpai_pumpforecast_v1)"
+  },
+  "features": {
+    "buy_velocity": "3s/5s/10s/30s window buy counts (f0-f3)",
+    "acceleration": "Velocity acceleration + volume acceleration (f4-f5)",
+    "volume": "Total buy SOL (f6)",
+    "wallet_quality": "S/A-tier counts, quality ratio, best rank, unique wallets (f7-f11)",
+    "order_flow": "Buy/sell ratio, SOL volume imbalance (f12-f13)",
+    "price_trajectory": "Gain since first seen, price slope (f14-f15)",
+    "freshness": "Token age linear + ultra-fresh flag (f16-f17)",
+    "coordination": "Bundle groups, whale detections (f18-f19)",
+    "trigger_wallet": "Tier, rank, trust score (f20-f22)",
+    "market_context": "HMM regime (f23)",
+    "polynomial_interactions": "vel×sTier, vel×price, accel×buy, diverse×fresh, vol×quality, rank×fresh, vol×euphoria, whale×vel (f24-f31)"
+  },
+  "integration_points": [
+    "WS feed → PUMP_FORECAST.recordTrade() on every trade",
+    "WHALE_DETECTOR → PUMP_FORECAST.recordWhale()",
+    "doBuy paper mode → forecast gate",
+    "doBuy live mode → forecast gate (in pre-gate section)",
+    "mlLearnFromTrade → PUMP_FORECAST.labelOutcome() auto-labels",
+    "ML dashboard → p4-pf stats display",
+    "Settings panel → t-pumpforecast toggle",
+    "Console → pumpForecast() diagnostic"
+  ],
+  "training_target": "Binary: did token hit 50%+ gain within 120s of entry?",
+  "thresholds": {
+    "calibrated_model": 0.45,
+    "cold_start_heuristic": 0.35
+  },
+  "also_patched": [
+    "§1: ML pre-gate added (wallet trust + cached rug scores) before buy HTTP",
+    "§1: ML post-veto delay reduced from 1000ms to 0ms",
+    "§2: _mlCache eviction (30s sweep + 500 entry hard cap)",
+    "§3: Feature buffer race condition (clone before ONNX async)",
+    "§4: MCTS 12.5% wasted compute eliminated (percentiles from main sims)",
+    "§5: ONLINE_SGD O(1479) → O(1) via _rankMap",
+    "§6: NTM norm pre-cached at store time",
+    "§7: posMonitor 3 loops → 1 consolidated loop",
+    "§8: new Date() → _cachedHour in 6 hot paths",
+    "§10: Calibration linear → Platt scaling",
+    "§11: MCTS returns numbers not .toFixed() strings",
+    "§12: Ensemble weight normalization guard",
+    "§13: ONNX multi-threading on desktop"
+  ]
+}
