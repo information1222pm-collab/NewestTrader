@@ -8217,6 +8217,18 @@ async function doBuy(mint,sym,w,solAmt,tokAmt,rAt){
   // ── LIVE MODE: FAST ML PRE-GATE → FIRE HTTP → ASYNC ML VETO ──
   if(!S.keypair||!S.pubkey){addFeed('warn','\u26d4 NO WALLET','Key required');return;}
 
+  // §SAFETY: Block LIVE trades if ONNX models aren't loaded
+  // Without ML models, the bot has no rug detection or pump scoring,
+  // meaning every signal passes and you bleed SOL on rugs.
+  // Hot wallets and wallets with TRADE_TIERS history can bypass this gate.
+  const _hasOnnx = !!(S.mlModels.rug || S.mlModels.pump);
+  const _hasTradeHistory = !!TRADE_TIERS.getAllocation(w.addr);
+  const _isHotWallet = !!HOT_WALLETS.isHot(w.addr);
+  if (!_hasOnnx && !_hasTradeHistory && !_isHotWallet) {
+    addFeed('warn', '\u26d4 ML GATE: '+sym, 'ONNX models not loaded — live trades blocked. Load rug_detector.onnx + pump_detector.onnx');
+    return;
+  }
+
   // ── FAST SYNCHRONOUS ML PRE-GATE (~0.2ms) ──────────────────────────
   // Checks cached ML scores + wallet trust BEFORE firing buy HTTP.
   // Full async ML ensemble runs immediately after as post-veto.
