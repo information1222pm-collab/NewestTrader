@@ -3884,6 +3884,8 @@ function mlLearnFromTrade(pos,pnlPct,isWin){
     HOT_WALLETS.recordOutcome(pos.sourceWallet, pnlPct, pos.sizeSol*(pnlPct/100), pos.sym, isWin, (Date.now()-pos.entryTime)/1000);
     // §TRADE_TIERS: Label and record trade outcome tier for capital allocation
     TRADE_TIERS.record(pos.sourceWallet, pnlPct, pos.sizeSol*(pnlPct/100), pos.sym, (Date.now()-pos.entryTime)/1000);
+    // §LEARNING_ENGINE: Capture trade + train all online models + update strategy
+    if(typeof LEARNING_ENGINE!=='undefined') LEARNING_ENGINE.learn(pos, pnlPct, isWin);
     // §ML_INTELLIGENCE: Record outcomes across all intelligence systems
     TOKEN_KNN.store(buildFeatures(w,pos.sizeSol*1e9,0,pos.mint), pnlPct, isWin, pos.sym);
     REGIME_SIZING.record(HMM.currentRegime().name, isWin, pnlPct);
@@ -4532,191 +4534,824 @@ const RL_EXIT = (() => {
 // Hard vetoes CANNOT be overridden. Soft signals contribute weighted votes.
 // ONE final {go, size, confidence, reasons[]} decision is produced.
 // ══════════════════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════════
+// §ALPHA_ENGINE v2 — Production 40× Hunting + 7 Enhancement Patches
+// MASTER FORMULA: ALPHA = (W*Wallet + E*Entry + L*Liquidity + M*Momentum
+//   + F*Flow - R^2.2*Rug) * FusionScore * NonLinearBoost
+// Patches: non-linear boost, true 40x detector, rug nuclear penalty,
+//          volatility-aware Kelly, exit pressure, wallet intent, pre-entry
+// ══════════════════════════════════════════════════════════════════════════════
 const TRADE_ORCHESTRATOR = (() => {
+  const AW = { wallet:0.30, entry:0.20, liquidity:0.15, momentum:0.15, flow:0.10, rug:0.25 };
+  const ENTER_THRESHOLD = 0.55;
+  const AGGRESSIVE_THRESH = 0.75;
+  const RUG_BLOCK_THRESH = 0.50;
 
-  // ── Signal weights (sum to ~1.0 for soft signals) ──
-  const W = {
-    embedded_ml_rug:  0.20,  // Embedded neural net rug probability
-    embedded_ml_pump: 0.15,  // Embedded neural net pump probability
-    wallet_trust:     0.15,  // Bayesian wallet trust score
-    forecast:         0.10,  // Pump forecast P(50% in 2min)
-    ev_calc:          0.10,  // Fee-adjusted expected value
-    lifecycle:        0.08,  // Token lifecycle stage
-    knn_similarity:   0.07,  // K-nearest neighbor historical similarity
-    convergence:      0.05,  // Multi-wallet convergence signal
-    regime:           0.05,  // HMM market regime confidence
-    darwin_wr:        0.05,  // Wallet Darwin win rate
-  };
+  // ── SUB-SCORE 1: WALLET SCORE + PATCH 7 (Wallet Intent) ──────────
+  function computeWalletScore(w) {
+    const wt = WALLET_TRUST.getScore(w.addr);
+    const bayesianTrust = wt.n > 0 ? wt.score : 0.5;
+    const dw = WALLET_DARWIN.getScore(w.addr);
+    const winRate = dw ? Math.min(1, dw.wr) : 0.5;
+    const tt = (typeof TRADE_TIERS !== 'undefined') ? TRADE_TIERS.getAllocation(w.addr) : null;
+    let avgROI = 0.3;
+    if (tt && tt.totalTrades >= 3) avgROI = Math.max(0, Math.min(1, 0.3 + (tt.score||0) * 0.7));
+    const earlyEntryRate = w.rank <= 50 ? 0.9 : w.rank <= 200 ? 0.7 : w.rank <= 500 ? 0.5 : 0.3;
+    const sizeConsistency = Math.min(1, w.wr7d || 0.5);
+    const hot = HOT_WALLETS.isHot(w.addr);
+    const recentBoost = hot ? Math.min(1, 0.5 + hot.winRate) : 0.3;
 
-  // ── Decision thresholds ──
-  const CONF_THRESHOLD = 0.38;       // minimum confidence to trade
-  const CONF_THRESHOLD_HOT = 0.25;   // lower threshold for hot wallets
-  const CONF_THRESHOLD_CONV = 0.30;  // lower threshold when 2+ wallets converge
+    const rawScore = (0.35*winRate) + (0.25*avgROI) + (0.15*earlyEntryRate)
+                   + (0.15*sizeConsistency) + (0.10*recentBoost);
 
+    // §PATCH 7: Wallet Intent — P(wallet holds 60s and hits 2x)
+    // Approximated from: win rate * early entry rate * (1 - recent loss streak)
+    const recentLosses = wt.streak < 0 ? Math.min(5, Math.abs(wt.streak)) : 0;
+    const intentScore = Math.max(0.3, winRate * earlyEntryRate * (1 - recentLosses * 0.1));
+
+    return {
+      score: Math.min(1, rawScore * bayesianTrust * intentScore * 1.5),
+      winRate, trust: bayesianTrust, avgROI, intentScore
+    };
+  }
+
+  // ── SUB-SCORE 2: ENTRY TIMING ────────────────────────────────────
+  function computeEntryTiming(mint, w) {
+    const latencyMs = S._wsLatency || 500;
+    const timingRaw = Math.exp(-latencyMs / 2500);
+    let clusterBoost = 1.0;
+    if (typeof CONVERGENCE !== 'undefined') {
+      const conv = CONVERGENCE.score(mint);
+      clusterBoost = Math.log(1 + conv.u10) + 1;
+    }
+    let rushPenalty = 1.0;
+    if (typeof ENTRY_TIMING !== 'undefined') {
+      const t = ENTRY_TIMING.shouldDelay(mint);
+      if (t.delay) rushPenalty = 0.7;
+    }
+    return { score: Math.min(1, timingRaw * clusterBoost * rushPenalty), latencyMs, clusterBoost };
+  }
+
+  // ── SUB-SCORE 3: LIQUIDITY ───────────────────────────────────────
+  function computeLiquidity(mint, sizeSol) {
+    let lpSol = 10;
+    if (typeof DEXS_CACHE !== 'undefined') {
+      const dex = DEXS_CACHE.get(mint);
+      if (dex && dex.data && dex.data.liquidityUsd) lpSol = dex.data.liquidityUsd / 150;
+    }
+    const rawLiq = Math.min(1, Math.sqrt(lpSol / 50));
+    let slipPenalty = 0.3;
+    if (typeof SLIPPAGE_PRED !== 'undefined') {
+      slipPenalty = Math.min(1, SLIPPAGE_PRED.predict(sizeSol, lpSol*150).slipPct / 12);
+    }
+    return { score: Math.max(0, rawLiq * (1 - slipPenalty)), lpSol, slipPenalty };
+  }
+
+  // ── SUB-SCORE 4: MOMENTUM ────────────────────────────────────────
+  function computeMomentum(mint) {
+    let priceVel = 0.3, volAccel = 0.3, tradeFreq = 0.3;
+    if (typeof LIFECYCLE !== 'undefined') {
+      const lc = LIFECYCLE.classify(mint);
+      priceVel = Math.max(0, Math.min(1, (lc.priceChange||0) * 3));
+      volAccel = Math.max(0, Math.min(1, (lc.buyRatio||0.5) * 1.5 - 0.25));
+    }
+    const pf = (typeof PUMP_FORECAST !== 'undefined') ? PUMP_FORECAST.forecast(mint, '') : null;
+    if (pf) tradeFreq = Math.max(0, Math.min(1, (pf.buyVel3s||0) * 4));
+    const regime = HMM.currentRegime();
+    const regBoost = regime.name==='EUPHORIA' ? 1.2 : regime.name==='FEAR' ? 0.7 : 1.0;
+    const raw = (0.5*priceVel) + (0.3*volAccel) + (0.2*tradeFreq);
+    return { score: Math.min(1, raw * regBoost), priceVel, volAccel, tradeFreq, regime: regime.name };
+  }
+
+  // ── SUB-SCORE 5: FLOW ────────────────────────────────────────────
+  function computeFlow(mint, solAmt) {
+    let buyRatio = 0.6;
+    if (typeof LIFECYCLE !== 'undefined') {
+      buyRatio = Math.max(0, Math.min(1, LIFECYCLE.classify(mint).buyRatio || 0.5));
+    }
+    const isWhale = (solAmt/1e9) > 1.0;
+    const whaleBoost = isWhale ? Math.log(1 + solAmt/1e9) + 1 : 1.0;
+    return { score: Math.min(1, buyRatio * whaleBoost), buyRatio, whaleBoost, isWhale };
+  }
+
+  // ── SUB-SCORE 6: RUG RISK ────────────────────────────────────────
+  function computeRugRisk(mint, w) {
+    let devConc = 0.3, lpUnlock = 0.5, sellPress = 0.2, contractRisk = 0.2, holderDist = 0.3;
+    const f = buildFeatures(w, 0, 0, mint);
+    if (_ML_EMBEDDED && _ML_EMBEDDED.ready) {
+      const rp = _calibrateRug(_ML_EMBEDDED.rugProb(f));
+      contractRisk = rp; devConc = Math.min(1, rp * 1.2);
+    }
+    if (typeof RUGCHECK_CACHE !== 'undefined') {
+      const rc = RUGCHECK_CACHE.get(mint);
+      if (rc && rc.data) {
+        if (rc.data.score !== undefined) devConc = Math.min(1, rc.data.score / 100);
+        if (rc.data.lpLocked !== undefined) lpUnlock = 1 - (rc.data.lpLocked || 0);
+        if (rc.data.dangerCount) contractRisk = Math.min(1, rc.data.dangerCount / 3);
+      }
+    }
+    if (typeof DEPLOYER_GRAPH !== 'undefined') {
+      const rc = typeof RUGCHECK_CACHE !== 'undefined' ? RUGCHECK_CACHE.get(mint) : null;
+      if (rc && rc.data && rc.data.creator) {
+        const rep = DEPLOYER_GRAPH.getReputation(rc.data.creator);
+        if (!rep.safe) devConc = Math.max(devConc, 0.8);
+        devConc = Math.max(devConc, rep.rugRate || 0);
+      }
+    }
+    if (typeof LIFECYCLE !== 'undefined') {
+      sellPress = Math.max(0, 1 - (LIFECYCLE.classify(mint).buyRatio || 0.5));
+    }
+    const wt = WALLET_TRUST.getScore(w.addr);
+    if (wt.score > 0.7 && wt.n > 10) { devConc *= 0.7; contractRisk *= 0.7; }
+
+    const linearScore = (0.30*devConc) + (0.20*lpUnlock) + (0.20*sellPress) + (0.15*contractRisk) + (0.15*holderDist);
+    return { score: Math.min(1, linearScore), devConc, lpUnlock, sellPress, contractRisk, holderDist };
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  // MASTER DECISION — with all 7 patches applied
+  // ════════════════════════════════════════════════════════════════════
   function decide(params) {
     const {mint, sym, w, solAmt, tokAmt, hotStatus, baseSz} = params;
     const result = {
-      go: false, size: baseSz, confidence: 0, reasons: [],
-      hardVeto: null, signals: {}, sizing: {}
+      go: false, size: baseSz, confidence: 0, alphaScore: 0, reasons: [],
+      hardVeto: null, signals: {}, sizing: {}, subScores: {}, is40x: false
     };
 
-    // ════════════════════════════════════════════════════════════
-    // PHASE 1: HARD VETOES — absolute blocks, no override possible
-    // ════════════════════════════════════════════════════════════
-
-    // 1a. Honeypot shield (cached check is instant)
+    // ═══ PHASE 1: HARD VETOES ═══
     const hpCached = HONEYPOT_SHIELD.getCached(mint);
-    if (hpCached && !hpCached.safe) {
-      result.hardVeto = '🍯 HONEYPOT: ' + hpCached.reason;
-      result.reasons.push(result.hardVeto);
-      return result;
-    }
-
-    // 1b. Deployer blacklist
-    // We check DEPLOYER_GRAPH if available
+    if (hpCached && !hpCached.safe) { result.hardVeto = '🍯 HONEYPOT: ' + hpCached.reason; return result; }
     if (typeof DEPLOYER_GRAPH !== 'undefined') {
       const _rc = typeof RUGCHECK_CACHE !== 'undefined' ? RUGCHECK_CACHE.get(mint) : null;
       if (_rc && _rc.data && _rc.data.creator && DEPLOYER_GRAPH.isBlocked(_rc.data.creator)) {
-        const rep = DEPLOYER_GRAPH.getReputation(_rc.data.creator);
-        result.hardVeto = '🚫 DEPLOYER BLOCKED: ' + rep.reason;
-        result.reasons.push(result.hardVeto);
-        return result;
+        result.hardVeto = '🚫 DEPLOYER: ' + DEPLOYER_GRAPH.getReputation(_rc.data.creator).reason; return result;
+      }
+    }
+    if (typeof COPY_DETECT !== 'undefined' && COPY_DETECT.isCopy(w.addr) && !hotStatus) {
+      result.hardVeto = '👥 COPY WALLET'; return result;
+    }
+    if (typeof GAS_QUEUE !== 'undefined' && GAS_QUEUE.isSpiking()) {
+      result.hardVeto = '⛽ GAS_SPIKE'; return result;
+    }
+
+    // ═══ PHASE 2: COMPUTE ALL 6 SUB-SCORES ═══
+    const ws = computeWalletScore(w);
+    const es = computeEntryTiming(mint, w);
+    const ls = computeLiquidity(mint, baseSz);
+    const ms = computeMomentum(mint);
+    const fs = computeFlow(mint, solAmt);
+    const rs = computeRugRisk(mint, w);
+    result.subScores = { wallet:ws, entry:es, liquidity:ls, momentum:ms, flow:fs, rug:rs };
+
+    // ═══ PHASE 3: MASTER FORMULA + PATCHES ═══
+
+    // §PATCH 4: Rug Nuclear Penalty — quadratic instead of linear
+    // This makes high rug scores exponentially more punishing
+    const rugPenalty = Math.pow(rs.score, 2.2);
+
+    const rawAlpha = (AW.wallet * ws.score) + (AW.entry * es.score) + (AW.liquidity * ls.score)
+                   + (AW.momentum * ms.score) + (AW.flow * fs.score) - rugPenalty;
+
+    // Multi-signal fusion: unique wallets = compounding edge
+    let fusionScore = 1.0;
+    if (typeof CONVERGENCE !== 'undefined') {
+      const conv = CONVERGENCE.score(mint);
+      fusionScore = 1 + 0.25 * Math.max(0, conv.count - 1);
+    }
+
+    // §PATCH 1: Non-Linear Alpha Boost — aligned signals compound exponentially
+    // When wallet + timing + momentum all agree, the true edge is much larger
+    // than a linear sum suggests
+    const nonLinearBoost = 1 + Math.pow(ws.score * es.score * ms.score, 1.5);
+
+    let alphaScore = Math.max(0, Math.min(1.5, rawAlpha * fusionScore * nonLinearBoost));
+    alphaScore = Math.min(1, alphaScore);
+
+    // §LEARNING_ENGINE: Apply learned model boost + strategy adaptation
+    // Online SGD models (win prob, 40x predictor, rug detector) modify the base alpha.
+    // Pattern matching finds similar historical setups and adjusts confidence.
+    // Strategy adapter tightens/loosens thresholds based on rolling performance.
+    let _learnBoost = null;
+    if (typeof LEARNING_ENGINE !== 'undefined' && LEARNING_ENGINE.trainCount >= 10) {
+      _learnBoost = LEARNING_ENGINE.boost(
+        {wallet:ws.score, entry:es.score, liquidity:ls.score, momentum:ms.score, flow:fs.score, rug:rs.score},
+        alphaScore
+      );
+      alphaScore = _learnBoost.alpha;
+    }
+
+    result.alphaScore = alphaScore;
+    result.confidence = alphaScore;
+    result._learnBoost = _learnBoost;
+
+    // ═══ RUG KILL SWITCH ═══
+    if (rs.score > RUG_BLOCK_THRESH) {
+      result.reasons.push('☠ RUG='+rs.score.toFixed(2)+'>'+RUG_BLOCK_THRESH+' nuclear='+rugPenalty.toFixed(3));
+      return result;
+    }
+
+    // ═══ HARD FILTERS (from production spec) ═══
+    if (ls.lpSol < 5 && !hotStatus) {
+      result.reasons.push('🚫 LP<5 SOL ('+ls.lpSol.toFixed(1)+')');
+      return result;
+    }
+
+    // ═══ PHASE 4: ALPHA DECISION ═══
+    let threshold = ENTER_THRESHOLD;
+    if (hotStatus) threshold = 0.40;
+    if (w.rank <= 5) threshold = 0.35;
+    if (fusionScore >= 1.5) threshold = Math.max(0.35, threshold - 0.10);
+    // §LEARNING_ENGINE: Strategy adapter adjusts threshold based on rolling performance
+    // Drawdown mode raises threshold (be more selective), euphoria lowers it slightly
+    if (_learnBoost) threshold = Math.max(0.30, threshold + _learnBoost.thresholdAdj);
+
+    // §PATCH 3: Pre-Wallet Entry Mode — momentum-first entries before wallet signal
+    // When momentum + flow + liquidity are all screaming, enter early at reduced size
+    const preEntry = !hotStatus && ms.score > 0.8 && fs.score > 0.75 && ls.score > 0.6 && ws.score < 0.4;
+    if (preEntry) {
+      threshold = 0.35; // lower threshold for momentum-driven entries
+      result.sizing.preEntry = true;
+    }
+
+    result.go = alphaScore >= threshold;
+
+    if (!result.go) {
+      result.reasons.push('α='+alphaScore.toFixed(3)+'<'+threshold.toFixed(2));
+      result.reasons.push('W='+ws.score.toFixed(2)+' E='+es.score.toFixed(2)
+        +' L='+ls.score.toFixed(2)+' M='+ms.score.toFixed(2)
+        +' F='+fs.score.toFixed(2)+' R='+rs.score.toFixed(2));
+    }
+
+    // ═══ PHASE 5: POSITION SIZING — Kelly + Volatility + 40× Patches ═══
+    let sz = baseSz;
+
+    // §PATCH 5: Volatility-Aware Kelly
+    // Reduce Kelly fraction when volatility is high (prevents oversizing in chaos)
+    const atrPct = (typeof POS_ATR !== 'undefined' && POS_ATR[mint]) ? POS_ATR[mint].atr / (POS_ATR[mint].trailPrice || 1) : 0.15;
+    const volatilityFactor = Math.min(1, 0.5 / Math.max(0.01, atrPct));
+    const wr = ws.winRate;
+    const avgWin = 0.40, avgLoss = 0.20;
+    const rawKelly = Math.max(0.05, Math.min(0.5, ((wr*avgWin)-((1-wr)*avgLoss)) / avgWin));
+    const kelly = rawKelly * volatilityFactor;
+    const availBal = Math.max(0, (S.balanceSol||0) - (CFG.res/100));
+    sz = Math.max(baseSz, kelly * availBal * alphaScore);
+
+    // Aggressive sizing when alpha is high
+    if (alphaScore > AGGRESSIVE_THRESH) { sz *= 1.5; result.sizing.aggressive = true; }
+
+    // §PATCH 2: True 40× Detector — all systems aligned = monster position
+    const is40x = ws.score > 0.75 && es.score > 0.7 && ms.score > 0.75
+               && fs.score > 0.7 && ls.score > 0.5 && rs.score < 0.4;
+    if (is40x) {
+      sz *= 2.0;
+      result.is40x = true;
+      result.sizing.fortyXBoost = true;
+      // Dynamic take profit and trail for 40x signals
+      result.sizing.takeProfit = 200; // 200% TP
+      result.sizing.trailDrop = -35;  // wider trail for runners
+    }
+
+    // Pre-entry: reduced size (40% of normal)
+    if (preEntry) sz *= 0.4;
+
+    // Hot wallet / trade tier allocation
+    let allocSol = 0, allocSource = '';
+    if (typeof TRADE_TIERS !== 'undefined') {
+      const ta = TRADE_TIERS.getAllocation(w.addr);
+      if (ta && ta.allocSol > allocSol) { allocSol = ta.allocSol; allocSource = ta.hasExtremeGains ? '💎EXTREME' : ta.dominantTier; }
+    }
+    if (hotStatus && hotStatus.capitalSol > allocSol) {
+      allocSol = hotStatus.capitalSol; allocSource = hotStatus.emoji + hotStatus.tier;
+    }
+    if (allocSol > sz) { sz = allocSol; result.sizing.allocSource = allocSource; }
+
+    // Regime sizing
+    if (typeof REGIME_SIZING !== 'undefined') {
+      const rm = REGIME_SIZING.getSizeMultiplier(ms.regime);
+      if (rm !== 1.0) { sz *= rm; result.sizing.regimeMult = rm; }
+    }
+
+    // Convergence boost
+    if (typeof CONVERGENCE !== 'undefined') {
+      const conv = CONVERGENCE.score(mint);
+      if (conv.boost > 1.0 && conv.count >= 2) { sz *= conv.boost; result.sizing.convBoost = conv.boost; }
+    }
+
+    // §LEARNING_ENGINE: Strategy adapter sizing (drawdown reduces, euphoria increases)
+    if (_learnBoost && _learnBoost.sizeMultiplier !== 1.0) {
+      sz *= _learnBoost.sizeMultiplier;
+      result.sizing.strategyMult = _learnBoost.sizeMultiplier;
+    }
+    // Hard caps
+    sz = Math.min(sz, availBal * 0.95);
+    sz = Math.max(sz, baseSz * 0.3);
+    result.size = sz;
+    if (result.go) result.reasons.push('α='+alphaScore.toFixed(3)+'≥'+threshold.toFixed(2));
+    return result;
+  }
+
+  return { decide, AW, ENTER_THRESHOLD, AGGRESSIVE_THRESH, RUG_BLOCK_THRESH };
+})();
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §PATCH 6: EXIT PRESSURE ENGINE — behavioral exit intelligence
+// Monitors sell velocity + liquidity drain + wallet exit rate in real-time.
+// Tightens stops or forces exit when pressure exceeds thresholds.
+// Wired into EXIT_PRIORITY as a HIGH priority signal.
+// ══════════════════════════════════════════════════════════════════════════════
+const EXIT_PRESSURE = (() => {
+  const _data = {}; // mint → {sellVel, liqDrain, walletExitRate, lastUpdate}
+
+  function update(mint, pos) {
+    if (!_data[mint]) _data[mint] = {sellVel:0, liqDrain:0, walletExitRate:0, lastUpdate:0};
+    const d = _data[mint];
+    const now = Date.now();
+    if (now - d.lastUpdate < 1000) return d; // throttle to 1/s
+
+    // Sell velocity: sell ratio trending (from lifecycle)
+    if (typeof LIFECYCLE !== 'undefined') {
+      const lc = LIFECYCLE.classify(mint);
+      d.sellVel = Math.max(0, 1 - (lc.buyRatio || 0.5)); // high sells = high velocity
+    }
+
+    // Liquidity drain: is health declining?
+    if (typeof LIQUIDITY !== 'undefined') {
+      const health = LIQUIDITY.getHealth(mint);
+      d.liqDrain = Math.max(0, 1 - health);
+    }
+
+    // Wallet exit rate: did the alpha wallet sell?
+    d.walletExitRate = pos._alphaSold ? 0.8 : 0;
+
+    d.lastUpdate = now;
+    return d;
+  }
+
+  function evaluate(mint, pos) {
+    const d = update(mint, pos);
+    const pressure = (0.4 * d.sellVel) + (0.3 * d.liqDrain) + (0.3 * d.walletExitRate);
+
+    if (pressure > 0.80) {
+      return {exit:true, tighten:false, pressure, reason:'exit_pressure_'+pressure.toFixed(2)};
+    }
+    if (pressure > 0.60) {
+      return {exit:false, tighten:true, pressure, tightenFactor:0.5, reason:'pressure_tighten'};
+    }
+    return {exit:false, tighten:false, pressure};
+  }
+
+  function clean(mint) { delete _data[mint]; }
+  return {update, evaluate, clean};
+})();
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §LEARNING_ENGINE — Self-Improving Adaptive Intelligence
+// Turns static alpha scoring into a system that compounds edge over time.
+// detect → score → execute → OBSERVE → LEARN → UPDATE → IMPROVE
+//
+// Components:
+//   1. TRADE_MEMORY — Full feature context logging for every trade
+//   2. ONLINE_MODELS — Win probability, 40× predictor, rug detector (online SGD)
+//   3. WEIGHT_OPTIMIZER — Auto-adjusts alpha engine weights from feature importance
+//   4. STRATEGY_ADAPTER — Self-correcting behavior based on rolling performance
+//   5. PATTERN_MATCHER — NTM-style pattern matching for similar historical setups
+// Persists in localStorage. Updates after every trade close.
+// ══════════════════════════════════════════════════════════════════════════════
+
+const LEARNING_ENGINE = (() => {
+  const DB_KEY = 'mchpai_learning_v1';
+  const LR = 0.01; // learning rate for online SGD
+
+  // ═══════════════════════════════════════════════════════════════
+  // 1. TRADE MEMORY — stores every trade with full feature context
+  // ═══════════════════════════════════════════════════════════════
+  let recentMemory = [];  // last 200 trades (fast adaptation)
+  let longTermMemory = []; // all trades (stability)
+  const MAX_RECENT = 200;
+  const MAX_LONG = 2000;
+
+  // 6 feature dimensions matching alpha engine sub-scores
+  const FEATURE_NAMES = ['wallet','entry','liquidity','momentum','flow','rug'];
+
+  function captureTradeRecord(pos, pnlPct, isWin, subScores) {
+    const record = {
+      // Feature context at entry time
+      features: {
+        wallet:    subScores?.wallet?.score   || pos._orchConf || 0.5,
+        entry:     subScores?.entry?.score    || 0.5,
+        liquidity: subScores?.liquidity?.score|| 0.5,
+        momentum:  subScores?.momentum?.score || 0.5,
+        flow:      subScores?.flow?.score     || 0.5,
+        rug:       subScores?.rug?.score      || 0.3,
+      },
+      // Execution data
+      entryPrice: pos.entryPrice || 0,
+      sizeSol: pos.sizeSol || 0,
+      walletRank: pos.walletRank || 9999,
+      tier: pos.tier || 'B',
+      regime: HMM.currentRegime().name,
+      // Outcome data
+      pnlPct,
+      isWin,
+      isBigWin: pnlPct > 100,
+      isRug: pnlPct < -80,
+      maxRunup: pos.highPrice > 0 && pos.entryPrice > 0 ?
+        ((pos.highPrice - pos.entryPrice) / pos.entryPrice) * 100 : 0,
+      holdSecs: (Date.now() - pos.entryTime) / 1000,
+      alphaScore: pos._orchConf || 0.5,
+      is40x: pos._is40x || false,
+      ts: Date.now()
+    };
+
+    recentMemory.push(record);
+    longTermMemory.push(record);
+    if (recentMemory.length > MAX_RECENT) recentMemory = recentMemory.slice(-MAX_RECENT);
+    if (longTermMemory.length > MAX_LONG) longTermMemory = longTermMemory.slice(-MAX_LONG);
+
+    return record;
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // 2. ONLINE MODELS — 3 SGD models that learn from every trade
+  // ═══════════════════════════════════════════════════════════════
+
+  // Model weights: 6 features + 1 bias
+  let winWeights = new Float32Array(7).fill(0);    // predicts P(win)
+  let bigWinWeights = new Float32Array(7).fill(0); // predicts P(100%+ gain)
+  let rugWeights = new Float32Array(7).fill(0);    // predicts P(rug/-80%)
+  let modelTrainCount = 0;
+
+  function sigmoid(x) { return x > 20 ? 1 : x < -20 ? 0 : 1 / (1 + Math.exp(-x)); }
+
+  function predictModel(weights, features) {
+    const f = features;
+    let z = weights[6]; // bias
+    z += weights[0] * (f.wallet || 0.5);
+    z += weights[1] * (f.entry || 0.5);
+    z += weights[2] * (f.liquidity || 0.5);
+    z += weights[3] * (f.momentum || 0.5);
+    z += weights[4] * (f.flow || 0.5);
+    z += weights[5] * (-(f.rug || 0.3)); // rug is negative signal
+    return sigmoid(z);
+  }
+
+  function trainModel(weights, features, target, lr) {
+    const pred = predictModel(weights, features);
+    const error = target - pred;
+    const f = features;
+    weights[0] += lr * error * (f.wallet || 0.5);
+    weights[1] += lr * error * (f.entry || 0.5);
+    weights[2] += lr * error * (f.liquidity || 0.5);
+    weights[3] += lr * error * (f.momentum || 0.5);
+    weights[4] += lr * error * (f.flow || 0.5);
+    weights[5] += lr * error * (-(f.rug || 0.3));
+    weights[6] += lr * error; // bias
+    return { pred, error, target };
+  }
+
+  function trainAllModels(record) {
+    modelTrainCount++;
+    const f = record.features;
+
+    // Model 1: Win probability
+    trainModel(winWeights, f, record.isWin ? 1 : 0, LR);
+
+    // Model 2: 40× / big win predictor
+    trainModel(bigWinWeights, f, record.isBigWin ? 1 : 0, LR * 2); // higher LR for rare events
+
+    // Model 3: Rug detector (self-training from actual rugs)
+    trainModel(rugWeights, f, record.isRug ? 1 : 0, LR * 3); // even higher LR — rugs are critical
+
+    return modelTrainCount;
+  }
+
+  // Public prediction functions
+  function predictWin(features) { return predictModel(winWeights, features); }
+  function predictBigWin(features) { return predictModel(bigWinWeights, features); }
+  function predictRug(features) { return predictModel(rugWeights, features); }
+
+  // ═══════════════════════════════════════════════════════════════
+  // 3. FEATURE IMPORTANCE + AUTO-WEIGHT ADJUSTMENT
+  // Tracks which features correlate most with PnL and adjusts
+  // the alpha engine weights accordingly.
+  // ═══════════════════════════════════════════════════════════════
+
+  let featureImportance = { wallet:0.30, entry:0.20, liquidity:0.15, momentum:0.15, flow:0.10, rug:0.25 };
+  let importanceUpdateCount = 0;
+
+  function updateFeatureImportance() {
+    if (recentMemory.length < 20) return; // need enough data
+    importanceUpdateCount++;
+
+    // Compute correlation between each feature and PnL
+    const correlations = {};
+    for (const fname of FEATURE_NAMES) {
+      const vals = recentMemory.map(r => r.features[fname] || 0);
+      const pnls = recentMemory.map(r => r.pnlPct);
+      const meanV = vals.reduce((s,v)=>s+v,0) / vals.length;
+      const meanP = pnls.reduce((s,v)=>s+v,0) / pnls.length;
+      let cov = 0, varV = 0, varP = 0;
+      for (let i = 0; i < vals.length; i++) {
+        const dv = vals[i] - meanV, dp = pnls[i] - meanP;
+        cov += dv * dp; varV += dv * dv; varP += dp * dp;
+      }
+      correlations[fname] = (varV > 0 && varP > 0) ? cov / Math.sqrt(varV * varP) : 0;
+    }
+
+    // Rug correlation should be negative (higher rug = lower PnL)
+    // We want positive importance for all features, so invert rug
+    correlations.rug = -correlations.rug;
+
+    // Normalize correlations to sum to 1.0 (maintaining relative proportions)
+    const absSum = Object.values(correlations).reduce((s,v) => s + Math.abs(v), 0);
+    if (absSum > 0.01) {
+      for (const fname of FEATURE_NAMES) {
+        const raw = Math.abs(correlations[fname]) / absSum;
+        // Blend with existing importance (slow adaptation: 90% old + 10% new)
+        featureImportance[fname] = featureImportance[fname] * 0.90 + raw * 0.10;
+      }
+      // Ensure minimum weights (no feature should go to zero)
+      for (const fname of FEATURE_NAMES) {
+        featureImportance[fname] = Math.max(0.05, featureImportance[fname]);
       }
     }
 
-    // 1c. Copy wallet filter (skip signals from known copiers)
-    if (typeof COPY_DETECT !== 'undefined' && COPY_DETECT.isCopy(w.addr) && !hotStatus) {
-      result.hardVeto = '👥 COPY WALLET: copies ' + (COPY_DETECT.getMasterFor(w.addr) || '?').slice(0,12);
-      result.reasons.push(result.hardVeto);
-      return result;
+    // Update TRADE_ORCHESTRATOR weights if available
+    if (typeof TRADE_ORCHESTRATOR !== 'undefined' && TRADE_ORCHESTRATOR.AW) {
+      TRADE_ORCHESTRATOR.AW.wallet = featureImportance.wallet;
+      TRADE_ORCHESTRATOR.AW.entry = featureImportance.entry;
+      TRADE_ORCHESTRATOR.AW.liquidity = featureImportance.liquidity;
+      TRADE_ORCHESTRATOR.AW.momentum = featureImportance.momentum;
+      TRADE_ORCHESTRATOR.AW.flow = featureImportance.flow;
+      TRADE_ORCHESTRATOR.AW.rug = featureImportance.rug;
     }
 
-    // 1d. Gas spike (queue, don't block — caller handles queueing)
-    if (typeof GAS_QUEUE !== 'undefined' && GAS_QUEUE.isSpiking()) {
-      result.hardVeto = '⛽ GAS_SPIKE';
-      result.reasons.push('Gas spike — signal should be queued');
-      return result;
+    return { correlations, importance: {...featureImportance}, updateCount: importanceUpdateCount };
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // 4. STRATEGY ADAPTER — self-correcting behavior
+  // Adjusts thresholds and sizing based on rolling performance.
+  // ═══════════════════════════════════════════════════════════════
+
+  let strategyState = {
+    recentWR: 0.5,          // rolling 50-trade win rate
+    streak: 0,              // current win/loss streak
+    drawdownMode: false,    // reduce aggression during drawdowns
+    euphoriMode: false,     // increase aggression during hot streaks
+    thresholdAdj: 0,        // adjustment to alpha threshold
+    sizeMultiplier: 1.0,    // adjustment to position sizing
+  };
+
+  function updateStrategy() {
+    if (recentMemory.length < 10) return strategyState;
+
+    // Rolling win rate (last 50 trades or all recent memory)
+    const last50 = recentMemory.slice(-50);
+    strategyState.recentWR = last50.filter(r => r.isWin).length / last50.length;
+
+    // Streak tracking
+    const lastTrade = recentMemory[recentMemory.length - 1];
+    if (lastTrade) {
+      if (lastTrade.isWin) {
+        strategyState.streak = strategyState.streak >= 0 ? strategyState.streak + 1 : 1;
+      } else {
+        strategyState.streak = strategyState.streak <= 0 ? strategyState.streak - 1 : -1;
+      }
     }
 
-    // ════════════════════════════════════════════════════════════
-    // PHASE 2: GATHER ALL SOFT SIGNALS (parallel-safe, ~0.5ms total)
-    // Each signal produces a score from 0.0 (bearish) to 1.0 (bullish)
-    // ════════════════════════════════════════════════════════════
+    // Drawdown detection: last 20 trades losing
+    const last20 = recentMemory.slice(-20);
+    const last20WR = last20.filter(r => r.isWin).length / last20.length;
+    strategyState.drawdownMode = last20WR < 0.35;
+    strategyState.euphoriMode = last20WR > 0.65 && strategyState.streak >= 3;
 
-    const signals = {};
-    const f = buildFeatures(w, solAmt, tokAmt, mint);
-
-    // 2a. Embedded ML rug detector → inverted (low rug = high signal)
-    if (_ML_EMBEDDED && _ML_EMBEDDED.ready) {
-      const rugRaw = _ML_EMBEDDED.rugProb(f);
-      const pumpRaw = _ML_EMBEDDED.pumpProb(f);
-      signals.embedded_ml_rug = 1.0 - _calibrateRug(rugRaw);  // inverted: low rug = high score
-      signals.embedded_ml_pump = _calibratePump(pumpRaw);
+    // Self-correction adjustments
+    if (strategyState.drawdownMode) {
+      // Losing: reduce size, increase threshold (be more selective)
+      strategyState.sizeMultiplier = 0.6;
+      strategyState.thresholdAdj = 0.08; // raise threshold by 0.08
+      addFeed('warn', '📉 STRATEGY: Drawdown mode', 'WR='+Math.round(last20WR*100)+'% last 20 → reduced size, higher threshold');
+    } else if (strategyState.euphoriMode) {
+      // Winning: increase aggression slightly
+      strategyState.sizeMultiplier = 1.3;
+      strategyState.thresholdAdj = -0.05; // lower threshold slightly
     } else {
-      signals.embedded_ml_rug = 0.5;
-      signals.embedded_ml_pump = 0.5;
+      // Normal
+      strategyState.sizeMultiplier = 1.0;
+      strategyState.thresholdAdj = 0;
     }
 
-    // 2b. Wallet trust
-    const wt = WALLET_TRUST.getScore(w.addr);
-    signals.wallet_trust = Math.max(0, Math.min(1, wt.score));
+    return strategyState;
+  }
 
-    // 2c. Pump forecast
-    if (CFG.pumpForecast && typeof PUMP_FORECAST !== 'undefined') {
-      const pf = PUMP_FORECAST.forecast(mint, w.addr);
-      signals.forecast = Math.max(0, Math.min(1, pf.prob));
-    } else {
-      signals.forecast = 0.5; // neutral if disabled
+  // ═══════════════════════════════════════════════════════════════
+  // 5. PATTERN MATCHER — find similar historical setups
+  // When a new signal arrives, find the K nearest historical trades
+  // and use their outcome distribution as a confidence multiplier.
+  // ═══════════════════════════════════════════════════════════════
+
+  function matchPattern(features, k) {
+    k = k || 7;
+    if (longTermMemory.length < k) return { avgPnl: 0, winRate: 0.5, confidence: 0, matches: 0 };
+
+    // Compute distance from input features to all stored trades
+    const distances = longTermMemory.map((record, i) => {
+      let dist = 0;
+      for (const fname of FEATURE_NAMES) {
+        const d = (features[fname] || 0.5) - (record.features[fname] || 0.5);
+        dist += d * d;
+      }
+      return { i, dist: Math.sqrt(dist) };
+    });
+
+    // Sort by distance, take K nearest
+    distances.sort((a, b) => a.dist - b.dist);
+    const nearest = distances.slice(0, k).map(d => longTermMemory[d.i]);
+
+    const avgPnl = nearest.reduce((s, r) => s + r.pnlPct, 0) / nearest.length;
+    const winRate = nearest.filter(r => r.isWin).length / nearest.length;
+    const bigWinRate = nearest.filter(r => r.isBigWin).length / nearest.length;
+    const avgDist = distances.slice(0, k).reduce((s, d) => s + d.dist, 0) / k;
+
+    // Confidence: higher when neighbors are close and we have lots of data
+    const confidence = Math.min(0.9, (1 / (1 + avgDist * 3)) * Math.min(1, longTermMemory.length / 100));
+
+    return { avgPnl, winRate, bigWinRate, confidence, matches: nearest.length, avgDist };
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // MASTER LEARN FUNCTION — called on every trade close
+  // ═══════════════════════════════════════════════════════════════
+
+  function learn(pos, pnlPct, isWin) {
+    // Capture full trade record
+    const record = captureTradeRecord(pos, pnlPct, isWin, pos._orchSubScores || null);
+
+    // Train all 3 online models
+    const trainCount = trainAllModels(record);
+
+    // Update feature importance every 25 trades
+    let importanceResult = null;
+    if (trainCount % 25 === 0 && trainCount > 0) {
+      importanceResult = updateFeatureImportance();
+      if (importanceResult) {
+        addFeed('ml', '🧬 WEIGHTS ADAPTED', Object.entries(importanceResult.importance)
+          .map(([k,v]) => k.slice(0,3)+'='+Math.round(v*100)+'%').join(' '));
+      }
     }
 
-    // 2d. EV calculator
-    if (typeof EV_CALC !== 'undefined') {
-      const _slipEst = (typeof SLIPPAGE_PRED !== 'undefined') ?
-        SLIPPAGE_PRED.predict(baseSz, 0).slipPct : 10;
-      const ev = EV_CALC.compute(w.addr, baseSz, _slipEst);
-      signals.ev_calc = ev.profitable ? Math.min(1, 0.5 + ev.netEV / 50) : Math.max(0, 0.3 + ev.netEV / 100);
-    } else {
-      signals.ev_calc = 0.5;
+    // Update strategy adaptation every 10 trades
+    if (trainCount % 10 === 0) {
+      updateStrategy();
     }
 
-    // 2e. Lifecycle stage
-    if (typeof LIFECYCLE !== 'undefined') {
-      const lc = LIFECYCLE.classify(mint);
-      const stageScores = {GENESIS:0.6, ACCUMULATION:0.8, PUMP:0.7, DISTRIBUTION:0.2, DUMP:0.1, DEATH:0.0};
-      signals.lifecycle = stageScores[lc.stage] || 0.5;
-    } else {
-      signals.lifecycle = 0.5;
+    return { record, trainCount, importanceResult };
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // BOOST FUNCTION — called by TRADE_ORCHESTRATOR to modify alpha
+  // Uses learned models + pattern matching to adjust the base alpha
+  // ═══════════════════════════════════════════════════════════════
+
+  function boost(features, baseAlpha) {
+    if (modelTrainCount < 10) return { alpha: baseAlpha, boost: 1.0 }; // insufficient data
+
+    // Online model predictions
+    const winProb = predictWin(features);
+    const bigWinProb = predictBigWin(features);
+    const rugProb = predictRug(features);
+
+    // Pattern matching
+    const pattern = matchPattern(features);
+
+    // Combine: base alpha * win confidence * (1 + big win bonus) * (1 - rug penalty)
+    const winMult = 0.5 + winProb; // 0.5 to 1.5
+    const bigWinMult = 1.0 + bigWinProb * 0.5; // 1.0 to 1.5
+    const rugMult = 1.0 - rugProb * 0.5; // 1.0 to 0.5
+    const patternMult = pattern.confidence > 0.3 ? (0.8 + pattern.winRate * 0.4) : 1.0; // 0.8 to 1.2
+
+    const totalBoost = winMult * bigWinMult * rugMult * patternMult;
+    const boostedAlpha = Math.min(1.0, baseAlpha * totalBoost);
+
+    // Strategy adapter adjustments
+    const threshAdj = strategyState.thresholdAdj || 0;
+    const sizeMult = strategyState.sizeMultiplier || 1.0;
+
+    return {
+      alpha: boostedAlpha,
+      boost: totalBoost,
+      winProb, bigWinProb, rugProb,
+      pattern,
+      thresholdAdj: threshAdj,
+      sizeMultiplier: sizeMult,
+      trainCount: modelTrainCount
+    };
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // PERSISTENCE
+  // ═══════════════════════════════════════════════════════════════
+
+  function save() {
+    try {
+      localStorage.setItem(DB_KEY, JSON.stringify({
+        recent: recentMemory.slice(-MAX_RECENT),
+        long: longTermMemory.slice(-MAX_LONG),
+        winW: Array.from(winWeights),
+        bigW: Array.from(bigWinWeights),
+        rugW: Array.from(rugWeights),
+        importance: featureImportance,
+        strategy: strategyState,
+        trainCount: modelTrainCount,
+        importanceUpdates: importanceUpdateCount
+      }));
+    } catch(e) { console.warn('[MCHPai] Learning save failed:', e.message); }
+  }
+
+  function load() {
+    try {
+      const d = localStorage.getItem(DB_KEY);
+      if (!d) return;
+      const p = JSON.parse(d);
+      if (p.recent) recentMemory = p.recent;
+      if (p.long) longTermMemory = p.long;
+      if (p.winW) winWeights = new Float32Array(p.winW);
+      if (p.bigW) bigWinWeights = new Float32Array(p.bigW);
+      if (p.rugW) rugWeights = new Float32Array(p.rugW);
+      if (p.importance) featureImportance = p.importance;
+      if (p.strategy) strategyState = p.strategy;
+      if (p.trainCount) modelTrainCount = p.trainCount;
+      if (p.importanceUpdates) importanceUpdateCount = p.importanceUpdates;
+      console.log('[MCHPai] §LEARNING restored:', modelTrainCount, 'trained trades,',
+        recentMemory.length, 'recent,', longTermMemory.length, 'long-term');
+    } catch(e) { console.warn('[MCHPai] Learning load failed:', e.message); }
+  }
+
+  load();
+
+  // Auto-save every 60s
+  setInterval(save, 60000);
+
+  return {
+    learn, boost, matchPattern,
+    predictWin, predictBigWin, predictRug,
+    updateFeatureImportance, updateStrategy,
+    save, load,
+    get trainCount() { return modelTrainCount; },
+    get recentWR() { return strategyState.recentWR; },
+    get strategy() { return strategyState; },
+    get importance() { return {...featureImportance}; },
+    get stats() {
+      return {
+        trainCount: modelTrainCount, recentSize: recentMemory.length,
+        longTermSize: longTermMemory.length, recentWR: strategyState.recentWR,
+        drawdown: strategyState.drawdownMode, euphoria: strategyState.euphoriMode,
+        importance: {...featureImportance}
+      };
     }
-
-    // 2f. KNN similarity
-    if (typeof TOKEN_KNN !== 'undefined' && TOKEN_KNN.size >= 5) {
-      const knn = TOKEN_KNN.findSimilar(f);
-      signals.knn_similarity = Math.max(0, Math.min(1, 0.3 + knn.winRate));
-    } else {
-      signals.knn_similarity = 0.5; // neutral if insufficient data
-    }
-
-    // 2g. Multi-wallet convergence
-    if (typeof CONVERGENCE !== 'undefined') {
-      const conv = CONVERGENCE.score(mint);
-      signals.convergence = Math.min(1.0, conv.count * 0.3); // 0=0.0, 1=0.3, 2=0.6, 3+=0.9+
-    } else {
-      signals.convergence = 0;
-    }
-
-    // 2h. HMM regime
-    const regime = HMM.currentRegime();
-    const regimeScores = {EUPHORIA:0.8, ROTATION:0.5, FEAR:0.2, NORMAL:0.5};
-    signals.regime = regimeScores[regime.name] || 0.5;
-
-    // 2i. Darwin win rate
-    const dw = WALLET_DARWIN.getScore(w.addr);
-    signals.darwin_wr = dw ? Math.max(0, Math.min(1, dw.wr)) : 0.5;
-
-    result.signals = signals;
-
-    // ════════════════════════════════════════════════════════════
-    // PHASE 3: COMPUTE WEIGHTED CONFIDENCE SCORE
-    // ════════════════════════════════════════════════════════════
-
-    let weightedSum = 0, totalWeight = 0;
-    for (const [key, weight] of Object.entries(W)) {
-      const signal = signals[key] !== undefined ? signals[key] : 0.5;
-      weightedSum += signal * weight;
-      totalWeight += weight;
-    }
-    result.confidence = totalWeight > 0 ? weightedSum / totalWeight : 0.5;
-
-    // ════════════════════════════════════════════════════════════
-    // PHASE 4: THRESHOLD DECISION
-    // ════════════════════════════════════════════════════════════
-
-    let threshold = CONF_THRESHOLD;
-    if (hotStatus) threshold = CONF_THRESHOLD_HOT;
-    else if (signals.convergence >= 0.6) threshold = CONF_THRESHOLD_CONV;
-    // Elite wallets (rank 1-5) get lowest threshold
-    if (w.rank <= 5) threshold = 0.20;
-
-    result.go = result.confidence >= threshold;
-
-    if (!result.go) {
-      result.reasons.push('CONF=' + result.confidence.toFixed(3) + ' < ' + threshold.toFixed(2));
-      // Identify the worst signals dragging confidence down
-      const worst = Object.entries(signals).sort((a,b) => a[1] - b[1]).slice(0, 3);
-      for (const [k, v] of worst) result.reasons.push(k + '=' + v.toFixed(2));
-    } else {
-      result.reasons.push('CONF=' + result.confidence.toFixed(3) + ' ≥ ' + threshold.toFixed(2));
-    }
-
-    // ════════════════════════════════════════════════════════════
-    // PHASE 5: UNIFIED SIZE COMPUTATION (one calculation, no conflicts)
+  };
+})();
     // ════════════════════════════════════════════════════════════
 
     let sz = baseSz;
+    const wr = dw ? dw.wr : 0.5;
+    const avgWin = 0.40, avgLoss = 0.20;
+    let kelly = Math.max(0.05, Math.min(0.5, ((wr*avgWin)-((1-wr)*avgLoss))/avgWin));
 
-    // 5a. Confidence-based scaling: high confidence → larger position
-    const confMult = 0.5 + result.confidence; // 0.88 conf → 1.38x, 0.50 conf → 1.0x
-    sz *= confMult;
+    // §REFINEMENT 5: Volatility-dampened Kelly
+    let volFactor = 1.0;
+    if (typeof ATR_STOP !== 'undefined' && ATR_STOP.data && ATR_STOP.data[mint]) {
+      const atrPct = (ATR_STOP.data[mint].atr || 0) / Math.max(0.01, baseSz) * 100;
+      volFactor = Math.min(1, 0.5 / Math.max(0.1, atrPct));
+    }
+    kelly *= volFactor;
+    const availBal = Math.max(0, (S.balanceSol || 0) - (CFG.res / 100));
+    sz = Math.max(baseSz, kelly * availBal * Math.min(1, alphaScore));
+
+    // Aggressive sizing when alpha > 0.75
+    if (alphaScore > 0.75) { sz *= 1.5; result.sizing.aggressive = true; }
+
+    // §REFINEMENT 8b: 40× candidate → 2x size, 200% TP, 45% trail
+    result.sizing.is40xCandidate = is40x;
+    result.sizing.nonLinearBoost = nonLinearBoost;
+    result.sizing.intentScore = intentScore;
+    result.sizing.fusionScore = fusionScore;
+    if (is40x) {
+      sz *= 2.0;
+      result.sizing.fortyXBoost = true;
+      result.sizing.takeProfit = 200;
+      result.sizing.trailWidth = 45;
+    } else if (wScore > 0.8 && Math.min(1,eScore) > 0.8 && mScore > 0.7) {
+      sz *= 1.5;
+      result.sizing.fortyXBoost = true;
+    }
+
+    // Pre-signal mode: reduced size
+    if (isPreSignal) { sz *= 0.4; result.sizing.preSignal = true; }
+
+    // Confidence-based scaling
+    sz *= (0.5 + Math.min(1, alphaScore));
 
     // 5b. Hot wallet / Trade tier allocation (take the HIGHER of the two)
     let allocSol = 0, allocSource = '';
@@ -4822,6 +5457,17 @@ const EXIT_PRIORITY = (() => {
     // HIGH PRIORITY — strong exit signals
     // ═══════════════════════════════════════════
 
+    // H0: §PATCH 6 — Exit Pressure Engine (sell velocity + liquidity drain + wallet exit)
+    if (typeof EXIT_PRESSURE !== 'undefined' && pos.priceTickCount >= 5) {
+      const ep = EXIT_PRESSURE.evaluate(mint, pos);
+      if (ep.exit) {
+        return {exit:true, reason:ep.reason, priority:'HIGH',
+          feedType:'sell', feedMsg:'🌊 EXIT PRESSURE: '+pos.sym+' p='+ep.pressure.toFixed(2)};
+      }
+      if (ep.tighten && pos._dynTrail) {
+        pos._dynTrail = Math.max(-50, pos._dynTrail * ep.tightenFactor);
+      }
+    }
     // H1: Stale position (no ticks for 90s)
     if (pos.priceTickCount === 0 && (now - pos.entryTime) > 90000) {
       return {exit:true, reason:'stale_no_ticks', priority:'HIGH',
@@ -9328,7 +9974,7 @@ async function doBuy(mint,sym,w,solAmt,tokAmt,rAt){
   
   // ── Handle soft rejection (confidence below threshold) ──
   if (!_decision.go) {
-    addFeed('info', '📊 ORCHESTRATOR BLOCK: '+sym, _decision.reasons.join(' | '));
+    addFeed('info', '📊 α-BLOCK: '+sym, _decision.reasons.join(' | '));
     // Feed to shadow tracker for monitoring without capital risk
     if(typeof SHADOW_TRACKER!=='undefined') SHADOW_TRACKER.open(mint,sym,w,solAmt,tokAmt,'LOW_CONF_'+_decision.confidence.toFixed(2));
     return;
@@ -9336,11 +9982,14 @@ async function doBuy(mint,sym,w,solAmt,tokAmt,rAt){
   
   // ── Approved — log the decision ──
   let sz = _decision.size;
-  addFeed('buy', '✅ ORCHESTRATOR GO: '+sym,
-    'conf='+_decision.confidence.toFixed(3)
-    +(' alloc='+(_decision.sizing.allocSource||'default'))
-    +(_decision.sizing.convBoost ? ' conv='+_decision.sizing.convBoost.toFixed(1)+'x' : '')
-    +(_decision.sizing.regimeMult ? ' regime='+_decision.sizing.regimeMult.toFixed(1)+'x' : '')
+  const _ss = _decision.subScores;
+  addFeed('buy', '🎯 α=' + _decision.alphaScore.toFixed(3) + (_decision.is40x?' 🔥40×':'') + ' GO: '+sym,
+    'W='+(_ss.wallet?.score||0).toFixed(2)+' E='+(_ss.entry?.score||0).toFixed(2)
+    +' L='+(_ss.liquidity?.score||0).toFixed(2)+' M='+(_ss.momentum?.score||0).toFixed(2)
+    +' F='+(_ss.flow?.score||0).toFixed(2)+' R='+(_ss.rug?.score||0).toFixed(2)
+    +(_decision.sizing.fortyXBoost?' ⚡2×SIZE':'')
+    +(_decision.sizing.aggressive?' 🔥AGGRO':'')
+    +(_decision.sizing.preEntry?' 📡PRE-ENTRY':'')
     +' → '+sz.toFixed(3)+'◎');
   
   // ── Entry Timing: delay if copy-rush detected ──
@@ -9384,7 +10033,9 @@ async function doBuy(mint,sym,w,solAmt,tokAmt,rAt){
     _s40x:_score,_s40les:_s40.les,_s40smp:_s40.smp,_s40ci:_s40.ci,_s40ma:_s40.ma,
     _lastRugProb:0.15,_lastPumpScore:0.65,_lastSgdProb:0.5,_lastWalletScore:0.5,_lastNtmScore:0.5,
     _convergenceCount:_decision.sizing.convBoost?Math.round(_decision.sizing.convBoost):0,
-    _rlTrajectory:[], _orchConf:_decision.confidence, _orchSignals:_decision.signals};
+    _rlTrajectory:[], _orchConf:_decision.confidence, _is40x:_decision.is40x||false,
+    _orchSubScores:_decision.subScores||null,
+    _dynTP:_decision.sizing.takeProfit||null, _dynTrail:_decision.sizing.trailDrop||null};
   S.risk.daily++;
   if(!S.wstats[w.rank])S.wstats[w.rank]={copies:0,wins:0,losses:0,pnl:0,totalHold:0};
   S.wstats[w.rank].copies++;
